@@ -27,7 +27,25 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const traceContextKey = "grpc-trace-bin"
+const (
+	traceContextKey     = "grpc-trace-bin"
+	httpTraceContextKey = "x-cloud-trace-context"
+)
+
+func parentSpanFromContext(ctx context.Context) (sc trace.SpanContext, ok bool) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	if traceContext := md[httpTraceContextKey]; len(traceContext) > 0 {
+		return propagation.FromHTTPHeader(traceContext[0])
+	}
+	if traceContext := md[traceContextKey]; len(traceContext) > 0 {
+		// Metadata with keys ending in -bin are actually binary. They are base64
+		// encoded before being put on the wire, see:
+		// https://github.com/grpc/grpc-go/blob/08d6261/Documentation/grpc-metadata.md#storing-binary-data-in-metadata
+		traceContextBinary := []byte(traceContext[0])
+		return propagation.FromBinary(traceContextBinary)
+	}
+	return trace.SpanContext{}, false
+}
 
 // TagRPC creates a new trace span for the client side of the RPC.
 //
@@ -40,7 +58,10 @@ func (c *ClientHandler) traceTagRPC(ctx context.Context, rti *stats.RPCTagInfo) 
 		trace.WithSampler(c.StartOptions.Sampler),
 		trace.WithSpanKind(trace.SpanKindClient)) // span is ended by traceHandleRPC
 	traceContextBinary := propagation.Binary(span.SpanContext())
-	return metadata.AppendToOutgoingContext(ctx, traceContextKey, string(traceContextBinary))
+	return metadata.AppendToOutgoingContext(ctx,
+		traceContextKey, string(traceContextBinary),
+		httpTraceContextKey, propagation.HTTPHeader(span.SpanContext()),
+	)
 }
 
 // TagRPC creates a new trace span for the server side of the RPC.
@@ -50,27 +71,15 @@ func (c *ClientHandler) traceTagRPC(ctx context.Context, rti *stats.RPCTagInfo) 
 //
 // It returns ctx, with the new trace span added.
 func (s *ServerHandler) traceTagRPC(ctx context.Context, rti *stats.RPCTagInfo) context.Context {
-	md, _ := metadata.FromIncomingContext(ctx)
 	name := strings.TrimPrefix(rti.FullMethodName, "/")
 	name = strings.Replace(name, "/", ".", -1)
-	traceContext := md[traceContextKey]
-	var (
-		parent     trace.SpanContext
-		haveParent bool
-	)
-	if len(traceContext) > 0 {
-		// Metadata with keys ending in -bin are actually binary. They are base64
-		// encoded before being put on the wire, see:
-		// https://github.com/grpc/grpc-go/blob/08d6261/Documentation/grpc-metadata.md#storing-binary-data-in-metadata
-		traceContextBinary := []byte(traceContext[0])
-		parent, haveParent = propagation.FromBinary(traceContextBinary)
-		if haveParent && !s.IsPublicEndpoint {
-			ctx, _ := trace.StartSpanWithRemoteParent(ctx, name, parent,
-				trace.WithSpanKind(trace.SpanKindServer),
-				trace.WithSampler(s.StartOptions.Sampler),
-			)
-			return ctx
-		}
+	parent, haveParent := parentSpanFromContext(ctx)
+	if haveParent && !s.IsPublicEndpoint {
+		ctx, _ := trace.StartSpanWithRemoteParent(ctx, name, parent,
+			trace.WithSpanKind(trace.SpanKindServer),
+			trace.WithSampler(s.StartOptions.Sampler),
+		)
+		return ctx
 	}
 	ctx, span := trace.StartSpan(ctx, name,
 		trace.WithSpanKind(trace.SpanKindServer),

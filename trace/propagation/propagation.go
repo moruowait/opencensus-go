@@ -46,10 +46,17 @@ package propagation // import "go.opencensus.io/trace/propagation"
 // trace_options = {1};
 
 import (
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"go.opencensus.io/trace"
 )
+
+const httpHeaderMaxSize = 200
 
 // Binary returns the binary format representation of a SpanContext.
 //
@@ -89,6 +96,65 @@ func FromBinary(b []byte) (sc trace.SpanContext, ok bool) {
 	if len(b) >= 2 && b[0] == 2 {
 		sc.TraceOptions = trace.TraceOptions(b[1])
 	}
+	return sc, true
+}
+
+// HTTPHeader returns HTTP header format representation of a SpanContext.
+//
+// If sc is the zero value, HTTPHeader returns an empty string.
+func HTTPHeader(sc trace.SpanContext) string {
+	if sc == (trace.SpanContext{}) {
+		return ""
+	}
+	sid := binary.BigEndian.Uint64(sc.SpanID[:])
+	return fmt.Sprintf("%s/%d;o=%d", hex.EncodeToString(sc.TraceID[:]), sid, int64(sc.TraceOptions))
+}
+
+// FromHTTPHeader returns the SpanContext represented by h.
+//
+// If h has is empty, or unreasonably large, FromHTTPHeader returns with
+// ok==false.
+//
+// See https://cloud.google.com/trace/docs/faq for the header HTTPFormat.
+func FromHTTPHeader(h string) (sc trace.SpanContext, ok bool) {
+	if h == "" || len(h) > httpHeaderMaxSize {
+		return trace.SpanContext{}, false
+	}
+
+	// Parse the trace id field.
+	slash := strings.Index(h, `/`)
+	if slash == -1 {
+		return trace.SpanContext{}, false
+	}
+	tid, h := h[:slash], h[slash+1:]
+
+	buf, err := hex.DecodeString(tid)
+	if err != nil {
+		return trace.SpanContext{}, false
+	}
+	copy(sc.TraceID[:], buf)
+
+	// Parse the span id field.
+	spanstr := h
+	semicolon := strings.Index(h, `;`)
+	if semicolon != -1 {
+		spanstr, h = h[:semicolon], h[semicolon+1:]
+	}
+	sid, err := strconv.ParseUint(spanstr, 10, 64)
+	if err != nil {
+		return trace.SpanContext{}, false
+	}
+	binary.BigEndian.PutUint64(sc.SpanID[:], sid)
+
+	// Parse the options field, options field is optional.
+	if !strings.HasPrefix(h, "o=") {
+		return sc, true
+	}
+	o, err := strconv.ParseUint(h[2:], 10, 64)
+	if err != nil {
+		return trace.SpanContext{}, false
+	}
+	sc.TraceOptions = trace.TraceOptions(o)
 	return sc, true
 }
 
